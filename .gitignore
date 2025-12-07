@@ -1,3 +1,4 @@
 *.pyc
 *.jpg
 image/README/1765016943275.png
+\__pycache__
