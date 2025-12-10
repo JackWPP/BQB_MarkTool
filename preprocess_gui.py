@@ -3,9 +3,11 @@ import os
 import json
 import math
 import time
+import shutil
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QProgressBar, QTextEdit, QFileDialog, 
-                             QMessageBox, QGroupBox, QSpinBox, QTabWidget, QLineEdit, QGridLayout, QSizePolicy, QScrollArea)
+                             QMessageBox, QGroupBox, QSpinBox, QTabWidget, QLineEdit, 
+                             QGridLayout, QSizePolicy, QScrollArea, QCheckBox, QProgressDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QWaitCondition, QMutex
 from PyQt6.QtGui import QPixmap
 
@@ -342,7 +344,7 @@ class PreprocessWindow(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(20)
         
-        grp_split = QGroupBox("切分大任务文件")
+        grp_split = QGroupBox("切分大任务文件 (Split Task)")
         split_layout = QGridLayout()
         split_layout.setSpacing(15)
 
@@ -355,10 +357,13 @@ class PreprocessWindow(QMainWindow):
         self.split_count_spin.setValue(100)
         self.split_count_spin.setSuffix(" 张/每份")
         self.split_count_spin.setMinimumWidth(150)
+        
+        self.zip_checkbox = QCheckBox("同时生成 ZIP 压缩包 (Generate .zip)")
+        self.zip_checkbox.setChecked(True)
 
-        self.split_btn = QPushButton("开始切分")
+        self.split_btn = QPushButton("开始切分并生成任务包 (Split & Generate)")
         self.split_btn.clicked.connect(self.run_split)
-        self.split_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        self.split_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
 
         split_layout.addWidget(QLabel("源 JSON:"), 0, 0)
         split_layout.addWidget(self.split_input_edit, 0, 1)
@@ -366,6 +371,7 @@ class PreprocessWindow(QMainWindow):
         
         split_layout.addWidget(QLabel("切分大小:"), 1, 0)
         split_layout.addWidget(self.split_count_spin, 1, 1)
+        split_layout.addWidget(self.zip_checkbox, 1, 2)
         
         split_layout.addWidget(self.split_btn, 2, 0, 1, 3)
         
@@ -376,9 +382,10 @@ class PreprocessWindow(QMainWindow):
         info_label = QLabel("""
         <b>使用说明:</b><br>
         1. 选择预处理生成的完整 JSON 文件 (如 <i>pre_annotated.json</i>)。<br>
-        2. 设置每个子任务包含的图片数量 (建议 100-200 张)。<br>
-        3. 点击切分，系统会自动生成多个 part 文件 (如 <i>_part1.json</i>)。<br>
-        4. 将生成的 part 文件分发给不同的标注人员。
+        2. 设置每个子任务包含的图片数量。<br>
+        3. 点击切分，系统会创建独立的任务文件夹。<br>
+        4. 每个文件夹包含：<b>需标注的图片文件</b> + <b>task_data.json</b>。<br>
+        5. 可直接分发压缩包给标注人员。
         """)
         # Update to dark theme compatible styling
         info_label.setStyleSheet("background: #333; padding: 15px; border-radius: 5px; color: #ddd; border: 1px solid #555;")
@@ -501,6 +508,7 @@ class PreprocessWindow(QMainWindow):
     def run_split(self):
         json_path = self.split_input_edit.text()
         per_file = self.split_count_spin.value()
+        do_zip = self.zip_checkbox.isChecked()
         
         if not os.path.exists(json_path):
             QMessageBox.warning(self, "错误", "找不到 JSON 文件。")
@@ -511,17 +519,85 @@ class PreprocessWindow(QMainWindow):
                 data = json.load(f)
             
             total = len(data)
+            if total == 0:
+                 QMessageBox.warning(self, "警告", "JSON 文件为空。")
+                 return
+
             chunks = math.ceil(total / per_file)
             
-            base_name = os.path.splitext(json_path)[0]
+            base_dir = os.path.dirname(json_path)
+            json_filename = os.path.basename(json_path)
+            base_name_no_ext = os.path.splitext(json_filename)[0]
+            
+            output_root = os.path.join(base_dir, f"{base_name_no_ext}_dist")
+            os.makedirs(output_root, exist_ok=True)
+            
+            # Progress Dialog
+            progress = QProgressDialog("正在处理任务包...", "取消", 0, total, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            
+            processed_count = 0
             
             for i in range(chunks):
+                if progress.wasCanceled():
+                    break
+                    
                 chunk_data = data[i*per_file : (i+1)*per_file]
-                chunk_filename = f"{base_name}_part{i+1}.json"
-                with open(chunk_filename, 'w', encoding='utf-8') as f:
-                    json.dump(chunk_data, f, ensure_ascii=False, indent=2)
                 
-            QMessageBox.information(self, "成功", f"已切分为 {chunks} 个文件。\n生成文件: {base_name}_part1.json 至 ...part{chunks}.json")
+                # Create task folder
+                task_folder_name = f"{base_name_no_ext}_task_{i+1:03d}"
+                task_folder_path = os.path.join(output_root, task_folder_name)
+                
+                # Clean recreate if exists
+                if os.path.exists(task_folder_path):
+                    shutil.rmtree(task_folder_path)
+                os.makedirs(task_folder_path, exist_ok=True)
+                
+                new_chunk_data = []
+                
+                for item in chunk_data:
+                    if progress.wasCanceled():
+                        break
+                        
+                    src_path = item.get("original_path")
+                    # Try to resolve relative path if absolute doesn't exist
+                    if not src_path or not os.path.exists(src_path):
+                        # Try relative to json dir
+                        possible_path = os.path.join(base_dir, item.get("filename", ""))
+                        if os.path.exists(possible_path):
+                            src_path = possible_path
+                    
+                    if src_path and os.path.exists(src_path):
+                        filename = os.path.basename(src_path)
+                        dst_path = os.path.join(task_folder_path, filename)
+                        
+                        try:
+                            shutil.copy2(src_path, dst_path)
+                            
+                            # Update item path for the task
+                            new_item = item.copy()
+                            new_item["original_path"] = filename # Relative path
+                            new_chunk_data.append(new_item)
+                        except Exception as copy_err:
+                            print(f"Copy error: {copy_err}")
+                    else:
+                        print(f"Warning: Image not found {src_path}")
+                    
+                    processed_count += 1
+                    progress.setValue(processed_count)
+                
+                # Save JSON in the folder
+                task_json_path = os.path.join(task_folder_path, "task_data.json")
+                with open(task_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(new_chunk_data, f, ensure_ascii=False, indent=2)
+                
+                # Zip if requested
+                if do_zip:
+                    shutil.make_archive(task_folder_path, 'zip', task_folder_path)
+
+            progress.setValue(total)
+            QMessageBox.information(self, "成功", f"已生成 {chunks} 个任务包。\n输出目录: {output_root}")
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"切分失败: {e}")

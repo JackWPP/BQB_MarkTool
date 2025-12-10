@@ -1,5 +1,4 @@
 PyQt6
 Pillow
-dashscope
 requests
 python-dotenv

@@ -8,12 +8,12 @@ import sys
 import threading
 from datetime import datetime
 from PIL import Image, ExifTags
-import dashscope
-from dashscope import MultiModalConversation
+import requests
+import base64
 import config
 
 # Set API Key
-dashscope.api_key = config.DASHSCOPE_API_KEY
+# dashscope.api_key = config.DASHSCOPE_API_KEY
 
 class ImagePreprocessor:
     def __init__(self, input_dir, output_file="pre_annotated.json"):
@@ -109,16 +109,18 @@ class ImagePreprocessor:
             return image_path
 
     def call_vlm(self, image_path):
-        """Call Qwen-VL to analyze the image."""
+        """Call Local VLM to analyze the image."""
         # Compress first
         temp_path = self.compress_image_for_api(image_path)
-        abs_path = os.path.abspath(temp_path)
-        local_uri = f"file://{abs_path}"
+        
+        try:
+            with open(temp_path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
-        prompt = """请分析这张图片。
+            prompt = """请分析这张图片。
 1. 判断季节 (Spring/Summer/Autumn/Winter)。
 2. 判断场景类型 (Landscape/Portrait/Activity/Documentary)。
-3. 提取画面中的关键物体 (不超过5个)。
+3. 提取画面中的关键物体 (不超过5个) 使用中文标签。
 请以纯JSON格式返回，不要包含Markdown格式标记，格式如下:
 {
     "season": "...",
@@ -126,23 +128,40 @@ class ImagePreprocessor:
     "objects": ["...", "..."]
 }"""
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"image": local_uri},
-                    {"text": prompt}
-                ]
+            headers = {
+                "Content-Type": "application/json"
             }
-        ]
-
-        try:
-            response = MultiModalConversation.call(
-                model=config.MODEL_NAME,
-                messages=messages,
-                stream=False
-            )
             
+            payload = {
+                "model": config.MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.7,
+                "max_tokens": -1,
+                "stream": False
+            }
+
+            response = requests.post(
+                f"{config.API_BASE_URL}/chat/completions",
+                headers=headers,
+                json=payload
+            )
+
             # Clean up temp file
             if temp_path != image_path and os.path.exists(temp_path):
                 try:
@@ -151,11 +170,13 @@ class ImagePreprocessor:
                     pass
 
             if response.status_code == 200:
-                content = response.output.choices[0].message.content[0]['text']
+                result = response.json()
+                content = result['choices'][0]['message']['content']
                 return content
             else:
-                print(f"API Error: {response.code} - {response.message}")
+                print(f"API Error: {response.status_code} - {response.text}")
                 return None
+
         except Exception as e:
             print(f"VLM Call Exception: {e}")
             if temp_path != image_path and os.path.exists(temp_path):
